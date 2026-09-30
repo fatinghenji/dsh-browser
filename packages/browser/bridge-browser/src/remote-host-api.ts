@@ -1,5 +1,5 @@
 /**
- * dsh 0.1.2 Host adapter.
+ * dsh 0.2 Host adapter.
  *
  * Unary calls go directly through TypertGateway. Long-lived Session and
  * forwarded-event streams use the Gateway wire seam, while `$events/result`
@@ -23,10 +23,20 @@ import {
 } from './extension-sessions.ts'
 import type { RespondResult } from './protocol.ts'
 
-/** Structural subset of dsh 0.1.2's Host TypertGateway service. */
+/** Structural subset of dsh 0.2's Host TypertGateway service. */
 export interface TypertGatewayLike {
   readonly wireStream: {
-    open(endpoint: string, payload: unknown, signal: AbortSignal): Promise<AsyncIterable<unknown>>
+    /**
+     * dsh 0.2: `(endpoint, payload, uplink, peer, signal)`.
+     * Legacy stubs/tests: `(endpoint, payload, signal)`.
+     */
+    open(
+      endpoint: string,
+      payload: unknown,
+      uplinkOrSignal: AsyncIterable<unknown> | AbortSignal,
+      peer?: unknown,
+      signal?: AbortSignal,
+    ): Promise<AsyncIterable<unknown>>
     failure(error: unknown): HostRpcFailure
   }
   invoke(request: {
@@ -37,7 +47,33 @@ export interface TypertGatewayLike {
   }): Promise<unknown>
 }
 
-/** Structural subset of dsh 0.1.2's Host Connection service. */
+/**
+ * Empty Client→Host uplink for in-process Host wireStream.open calls.
+ * dsh 0.2 requires the uplink slot; Gateway-owned endpoints ($events) discard
+ * it immediately, and Remote streams still need a valid AsyncIterable.
+ */
+const EMPTY_WIRE_UPLINK: AsyncIterable<unknown> = {
+  async *[Symbol.asyncIterator]() { /* no uplink items */ },
+}
+
+/**
+ * Open a Host wire stream against either dsh 0.2 or the legacy three-arg form.
+ *
+ * - arity 3: composition/unit stubs still use `(endpoint, payload, signal)`.
+ * - arity 5: real dsh 0.2 TypertGatewayWireStream.
+ * - arity 0: Cordis/service wrappers — must use the five-arg call. Treating
+ *   these as three-arg maps AbortSignal onto uplink and leaves signal
+ *   undefined (hello.ok → stream-failed → WS 1011).
+ */
+function openWireStream(gateway: TypertGatewayLike, endpoint: string, payload: unknown, signal: AbortSignal): Promise<AsyncIterable<unknown>> {
+  const open = gateway.wireStream.open
+  if (open.length === 3) {
+    return open(endpoint, payload, signal)
+  }
+  return open(endpoint, payload, EMPTY_WIRE_UPLINK, undefined, signal)
+}
+
+/** Structural subset of dsh 0.2's Host Connection service. */
 export interface HostConnectionLike {
   createSharedFetchHandler(channel: '/api'): {
     fetch(request: Request): Promise<Response>
@@ -57,6 +93,8 @@ interface SessionSnapshot {
   readonly records: readonly unknown[]
   readonly hasMore: boolean
   readonly projections?: unknown
+  readonly assistantStream?: unknown
+  readonly snapshotId?: string
 }
 
 interface PendingQuestion {
@@ -64,7 +102,7 @@ interface PendingQuestion {
   settled: boolean
 }
 
-/** Build the dsh 0.1.2 Host implementation. */
+/** Build the dsh 0.2 Host implementation. */
 export function createRemoteHostApi(
   gateway: TypertGatewayLike,
   connection: HostConnectionLike,
@@ -217,7 +255,7 @@ class RemoteHostApi implements BrowserHostApi {
     try {
       const controller = new AbortController()
       const signal = AbortSignal.any([call.signal, controller.signal])
-      const source = await this.gateway.wireStream.open('workspace/follow', { args: {} }, signal)
+      const source = await openWireStream(this.gateway, 'workspace/follow', { args: {} }, signal)
       const iterator = source[Symbol.asyncIterator]()
       try {
         const first = await iterator.next()
@@ -382,12 +420,13 @@ class EventGeneration {
     this.followedSessionId = sessionId
     const signal = AbortSignal.any([this.signal, callSignal, controller.signal])
     try {
-      const source = await this.gateway.wireStream.open(
+      const source = await openWireStream(this.gateway,
         'session/follow',
         {
           args: {
             request: {
               address: { kind: 'session', sessionId },
+              assistantStream: true,
               ...(maxMessages === undefined ? {} : { maxMessages }),
             },
           },
@@ -406,12 +445,29 @@ class EventGeneration {
         throw new Error('browser bridge Session follower was replaced while opening')
       }
       this.onHistoryCursor(sessionId, first.value.cursor)
+      const snapshotId = first.value.assistantStream === undefined ? undefined : crypto.randomUUID()
+      // Publish the reconnect prefix before any suffix chunks. RPC responses
+      // and pushed events can otherwise race, dropping the beginning of an
+      // already-running attempt when the panel reopens its history.
+      if (first.value.assistantStream !== undefined) {
+        this.queue.push({
+          rpcId: crypto.randomUUID(),
+          method: 'session/assistant-stream',
+          payload: {
+            sessionId,
+            snapshotId,
+            frame: { type: 'snapshot', baseline: first.value.assistantStream },
+          },
+        })
+      }
       this.track(this.pumpSessionEvents(sessionId, revision, iterator, signal))
       return {
         cursor: first.value.cursor,
         records: first.value.records,
         hasMore: first.value.hasMore,
         ...(first.value.projections === undefined ? {} : { projections: first.value.projections }),
+        ...(first.value.assistantStream === undefined ? {} : { assistantStream: first.value.assistantStream }),
+        ...(snapshotId === undefined ? {} : { snapshotId }),
       }
     } catch (error: unknown) {
       if (revision === this.followRevision) {
@@ -436,6 +492,14 @@ class EventGeneration {
         // generation update the extension's active/recent session state.
         if (signal.aborted || revision !== this.followRevision) break
         if (next.done) break
+        if (isRecord(next.value) && next.value.type === 'assistant-stream' && isRecord(next.value.frame)) {
+          this.queue.push({
+            rpcId: crypto.randomUUID(),
+            method: 'session/assistant-stream',
+            payload: { sessionId, frame: next.value.frame },
+          })
+          continue
+        }
         if (!isSessionEventEntry(next.value)) {
           throw new TypeError('session/follow emitted an invalid incremental frame')
         }
@@ -463,7 +527,7 @@ class EventGeneration {
 
   private async pumpRemoteEvents(): Promise<void> {
     try {
-      const source = await this.gateway.wireStream.open('$events', { args: {} }, this.signal)
+      const source = await openWireStream(this.gateway, '$events', { args: {} }, this.signal)
       let ready = false
       for await (const value of source) {
         if (!ready) {
@@ -656,12 +720,13 @@ async function oneShotSessionSnapshot(
 ): Promise<SessionSnapshot> {
   const controller = new AbortController()
   const signal = AbortSignal.any([outerSignal, controller.signal])
-  const source = await gateway.wireStream.open(
+  const source = await openWireStream(gateway,
     'session/follow',
     {
       args: {
         request: {
           address: { kind: 'session', sessionId },
+          assistantStream: true,
           ...(maxMessages === undefined ? {} : { maxMessages }),
         },
       },
@@ -679,6 +744,7 @@ async function oneShotSessionSnapshot(
       records: first.value.records,
       hasMore: first.value.hasMore,
       ...(first.value.projections === undefined ? {} : { projections: first.value.projections }),
+      ...(first.value.assistantStream === undefined ? {} : { assistantStream: first.value.assistantStream }),
     }
   } finally {
     controller.abort(new Error('Session snapshot received'))
@@ -688,12 +754,14 @@ async function oneShotSessionSnapshot(
 
 function historyValue(snapshot: SessionSnapshot): Record<string, unknown> {
   return {
-    // 0.1.2 snapshots compact consecutive Assistant deltas into chunk rows.
-    // The extension intentionally keeps its small scalar-event model, so the
-    // Host boundary expands those rows losslessly before crossing our wire.
+    // V3 records remain durable events with embedded Assistant streams. Keep
+    // the legacy chunk-row decoder for older logs/Hosts, without assigning
+    // synthetic durable seqs to the new process-local assistant stream.
     events: snapshot.records.flatMap(historyRecordEvents).map(event => ({ event })),
     hasMore: snapshot.hasMore,
     ...(snapshot.projections === undefined ? {} : { projections: snapshot.projections }),
+    ...(snapshot.assistantStream === undefined ? {} : { assistantStream: snapshot.assistantStream }),
+    ...(snapshot.snapshotId === undefined ? {} : { snapshotId: snapshot.snapshotId }),
   }
 }
 
@@ -874,6 +942,7 @@ function isSessionSnapshot(value: unknown): value is {
   readonly records: readonly unknown[]
   readonly hasMore: boolean
   readonly projections?: unknown
+  readonly assistantStream?: unknown
 } {
   return isRecord(value)
     && value.type === 'snapshot'

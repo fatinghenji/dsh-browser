@@ -1,21 +1,21 @@
 /**
  * REAL-composition coverage: a test-only cordis.yml booted through the
  * published Loader mounts the webserver, the minimal spine (sessions /
- * user-questions / agents / system-prompt / tools), a test-only modern Remote
- * or legacy ApiProxy Host seam, and the bridge plugin itself. A real WebSocket
+ * user-questions / agents / system-prompt / tools), a test-only Remote
+ * Host seam, and the bridge plugin itself. A real WebSocket
  * client then authenticates over a real socket and drives Host calls against
  * the real Session store; disposal removes the tool registrations (HMR safety).
  *
- * Mocked boundary: the unpublished Gateway / Connection / ApiProxy services;
+ * Mocked boundary: the Gateway / Connection services;
  * focused adapter tests pin their wire contracts against the upstream source,
- * while these cases verify runtime transport selection and Loader topology.
+ * while these cases verify Remote transport and Loader topology.
  */
 
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
@@ -25,43 +25,14 @@ import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRegistry from '@deepseek-ai/dsh-tools'
-import LlmService from '@deepseek-ai/dsh-llm'
+import LlmService, { createUserMessage, type GenerateOptions, type UserMessage } from '@deepseek-ai/dsh-llm'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import { createSessionFormatV3ToV4 } from '@deepseek-ai/dsh-session-format-v3-to-v4'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
-import type { ApiProxy } from '@deepseek-ai/dsh-host-apiproxy/api'
 import * as BridgeBrowser from '../src/index.ts'
-import { BRIDGE_PATH, type BridgeFrame } from '../src/protocol.ts'
-
-// The default test workspace is intentionally a coherent 0.1.2 graph, so
-// loading the rc.2 package implementation here would mix incompatible peers.
-// Keep the carrier at the same structural seam as Gateway / Connection while
-// still exercising the bridge's real dynamic import and ApiProxy selection.
-vi.mock('@deepseek-ai/dsh-host-apiproxy', () => ({
-  toFetchHandler: (api: ApiProxy) => ({
-    async fetch(request: Request): Promise<Response> {
-      const envelope = await request.json() as {
-        rpcId: string
-        method: string
-        payload: unknown
-      }
-      if (envelope.method === 'session.create') {
-        const response = await api.sessions.create({
-          rpcId: envelope.rpcId,
-          payload: envelope.payload,
-        } as Parameters<ApiProxy['sessions']['create']>[0])
-        return Response.json({ type: 'server-response', ...response })
-      }
-      if (envelope.method === 'session.list') {
-        const response = await api.sessions.list({
-          rpcId: envelope.rpcId,
-          payload: envelope.payload,
-        } as Parameters<ApiProxy['sessions']['list']>[0])
-        return Response.json({ type: 'server-response', ...response })
-      }
-      return new Response('unexpected legacy composition method', { status: 404 })
-    },
-  }),
-}))
+import { BRIDGE_INJECT_BROWSER_SNAPSHOT_METHOD, BRIDGE_PATH, type BridgeFrame } from '../src/protocol.ts'
+import { BROWSER_CONTEXT_KIND } from '../src/browser-context.ts'
 
 const BRIDGE = '@yuxianglin/dsh-bridge-browser'
 const TOKEN = 'abcdabcdabcdabcdabcdabcdabcdabcd'
@@ -77,7 +48,7 @@ afterEach(async () => {
 })
 
 /**
- * Minimal structural implementation of the dsh 0.1.2 Host seams. Focused
+ * Minimal structural implementation of the dsh 0.1.5 Host seams. Focused
  * Remote-adapter tests pin the argument and stream contracts separately; this
  * fixture verifies Loader injection, real sockets, and real Session storage.
  */
@@ -85,16 +56,10 @@ const RemoteApiHost = {
   name: 'remote-api-host',
   inject: ['sessions'],
   apply(ctx: Context, config: { cwd: string }): void {
-    let remoteEventsReady = false
     const gateway = {
       wireStream: {
         async open(endpoint: string, _payload: unknown, signal: AbortSignal): Promise<AsyncIterable<unknown>> {
           if (endpoint === '$events') {
-            if (!remoteEventsReady) {
-              throw Object.assign(new Error('forwarded Remote event source is unavailable'), {
-                code: 'gateway/service-unavailable',
-              })
-            }
             return {
               async *[Symbol.asyncIterator]() {
                 yield { type: 'ready', clientId: 'composition-client', host: { home: root } }
@@ -111,10 +76,6 @@ const RemoteApiHost = {
           message: String(error),
           details: {},
         }),
-      },
-      registerRemoteEvents: () => {
-        remoteEventsReady = true
-        return async () => { remoteEventsReady = false }
       },
       async invoke(request: { namespace: string; method: string; args: Record<string, unknown> }) {
         if (request.namespace === 'session' && request.method === 'create') {
@@ -154,82 +115,18 @@ const RemoteApiHost = {
   },
 }
 
-/**
- * Minimal structural implementation of the dsh 0.1.1-rc.2 Host topology.
- * The gateway deliberately has no wireStream and rejects invoke calls, so a
- * successful round-trip proves the bridge selected and mounted ApiProxy.
- */
-const LegacyApiHost = {
-  name: 'legacy-api-host',
-  inject: ['sessions'],
-  apply(ctx: Context, config: { cwd: string }): void {
-    const gateway = {
-      async invoke(): Promise<never> {
-        throw new Error('legacy composition must route through ApiProxy')
-      },
-    }
-    const apiProxy = {
-      sessions: {
-        async create(request: { rpcId: string; payload: { sessionId?: string; cwd?: string } }) {
-          const session = ctx.sessions.create(
-            SessionId(request.payload.sessionId ?? `session-${crypto.randomUUID()}`),
-            { meta: { cwd: request.payload.cwd ?? config.cwd } },
-          )
-          return {
-            rpcId: request.rpcId,
-            result: { ok: true, value: { sessionId: session.id } },
-          }
-        },
-        async list(request: { rpcId: string }) {
-          return {
-            rpcId: request.rpcId,
-            result: {
-              ok: true,
-              value: {
-                items: ctx.sessions.list().map(session => ({
-                  sessionId: session.id,
-                  cwd: session.header.cwd,
-                  running: false,
-                  blank: session.seq === 0,
-                  updatedAt: session.header.createdAt,
-                })),
-              },
-            },
-          }
-        },
-      },
-      events: {
-        async *mux(_request: unknown, signal: AbortSignal) {
-          await new Promise<void>((resolve) => {
-            if (signal.aborted) return resolve()
-            signal.addEventListener('abort', () => { resolve() }, { once: true })
-          })
-        },
-      },
-    } as unknown as ApiProxy
-    ctx.provide('typertGateway' as never, gateway as never)
-    // `connection` is part of both supported published profiles even though
-    // the legacy adapter does not consume it after transport selection.
-    ctx.provide('connection' as never, {} as never)
-    ctx.provide('apiProxy' as never, apiProxy as never)
-  },
-}
-
-type CompositionTransport = 'remote' | 'legacy'
-
 /** Write a dist fixture and the composition cordis.yml, then boot it through the real Loader. */
-async function loadComposition(
-  transport: CompositionTransport = 'remote',
-): Promise<{ ctx: Context; configPath: string; port: number }> {
+async function loadComposition(): Promise<{ ctx: Context; configPath: string; port: number }> {
   root = await mkdtemp(join(tmpdir(), 'dsh-bridge-browser-'))
   const configPath = join(root, 'cordis.yml')
-  const apiHostName = `test:${transport}-api-host`
+  const apiHostName = 'test:remote-api-host'
   await writeFile(configPath, [
     "- name: '@deepseek-ai/dsh-host-webserver'",
     '  config:',
     "    host: '127.0.0.1'",
     '    port: 0',
     "- name: '@deepseek-ai/dsh-session'",
+    "- name: '@deepseek-ai/dsh-session-projection'",
     "- name: '@deepseek-ai/dsh-user-questions'",
     "- name: '@deepseek-ai/dsh-agent'",
     "- name: '@deepseek-ai/dsh-system-prompt'",
@@ -256,13 +153,14 @@ async function loadComposition(
   const modules = new Map<string, unknown>([
     ['@deepseek-ai/dsh-host-webserver', WebServer],
     ['@deepseek-ai/dsh-session', SessionStore],
+    ['@deepseek-ai/dsh-session-projection', SessionProjectionRegistry],
     ['@deepseek-ai/dsh-user-questions', UserQuestionService],
     ['@deepseek-ai/dsh-agent', AgentRegistry],
     ['@deepseek-ai/dsh-system-prompt', SystemPrompt],
     ['@deepseek-ai/dsh-tools', ToolRegistry],
     ['@deepseek-ai/dsh-llm', LlmService],
     ['@deepseek-ai/dsh-agent-loop', AgentLoop],
-    [apiHostName, transport === 'remote' ? RemoteApiHost : LegacyApiHost],
+    [apiHostName, RemoteApiHost],
     [BRIDGE, BridgeBrowser],
   ])
   context.loader.internal = {
@@ -331,6 +229,94 @@ async function connectReady(port: number): Promise<Awaited<ReturnType<typeof con
 }
 
 describe('real Loader composition', () => {
+  it.each(['native', 'migrated'] as const)('supersedes a %s followed page through the durable inbox without waking an idle Agent', async (snapshotKind) => {
+    const { ctx, port } = await loadComposition()
+    const client = await connectReady(port)
+    const sessionId = SessionId('followed-page-lifecycle')
+    const requests: GenerateOptions[] = []
+    ctx.on('llm/stream', async function* (request) {
+      requests.push(request)
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: 'Read the current page.' } }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    })
+
+    const followPage = async (id: string, snapshot: string): Promise<void> => {
+      send(client.ws, {
+        t: 'rpc', id, method: BRIDGE_INJECT_BROWSER_SNAPSHOT_METHOD,
+        payload: { sessionId, snapshot },
+      })
+      await waitFor(() => client.frames.some(frame => frame.t === 'rpc.result' && frame.id === id))
+      expect(client.frames.find(frame => frame.t === 'rpc.result' && frame.id === id)).toMatchObject({ ok: true })
+    }
+
+    // This snapshot arrives before async creation publishes the Agent. The
+    // bridge's real agent/created listener must flush it into the new inbox.
+    await followPage('before-create', 'Page: provisional tab')
+    const agent = await ctx.agentLoop.create(sessionId, { provider: 'test', model: 'test' })
+    expect(ctx.agents.get(sessionId)).toBe(agent)
+    expect(agent.inbox.nextStep).toHaveLength(1)
+    expect(agent.inbox.nextStep[0]?.content).toContainEqual({ type: 'text', text: expect.stringContaining('provisional tab') })
+
+    if (snapshotKind === 'migrated') {
+      // Exercise the published V3-to-V4 conversion of a durable pending
+      // snapshot under the 0.2 browser-context producer kind.
+      const snapshot = agent.inbox.nextStep[0]!
+      const queued = agent.session.snapshotEvents().find(event => event.type === 'agent/inbox/spliced')!
+      const migration = createSessionFormatV3ToV4([])
+      const sourceHeader = { ...agent.session.header, version: 3, delegationDepth: 0 }
+      const stage = migration.createStage({
+        sourceHeader,
+        targetHeader: migration.migrateHeader(sourceHeader),
+        sourceInheritedEventCount: 0,
+        sourceKind: 'decoded',
+      })
+      const restored: UserMessage[] = []
+      const output = {
+        emitEvent(event: Parameters<typeof stage.transformEvent>[0]): void {
+          restored.push(...(event.data as unknown as { inserted: UserMessage[] }).inserted)
+        },
+        emitRun(): never { throw new Error('unexpected compact run') },
+      }
+      stage.transformEvent({
+        ...queued,
+        seq: 0,
+        data: { ...queued.data, inserted: [{ ...snapshot, source: { ...snapshot.source, kind: BROWSER_CONTEXT_KIND } }] },
+      }, output)
+      stage.finish(output)
+      expect(restored).toHaveLength(1)
+      expect(restored[0]!.source.kind).toBe(BROWSER_CONTEXT_KIND)
+      expect(restored[0]!.source).not.toHaveProperty('plugin')
+      agent.inbox.remove(snapshot.id)
+      agent.inbox.append('next-step', restored[0]!)
+    }
+
+    const steering = createUserMessage({
+      content: [{ type: 'text', text: 'Keep my page selection.' }], source: { kind: 'human' },
+    })
+    agent.inbox.append('next-step', steering)
+    await followPage('live-page', 'Page: current tab')
+
+    expect(agent.status).toBe('idle')
+    expect(requests).toHaveLength(0)
+    expect(agent.inbox.nextStep).toHaveLength(2)
+    expect(agent.inbox.nextStep[0]?.id).toBe(steering.id)
+    expect(JSON.stringify(agent.inbox.nextStep)).not.toContain('provisional tab')
+    expect(agent.session.snapshotEvents().some(event => event.type === 'agent/inbox/spliced'
+      && event.data.outcome === 'canceled')).toBe(true)
+
+    agent.followup(createUserMessage({
+      content: [{ type: 'text', text: 'Summarize this page.' }], source: { kind: 'human' },
+    }))
+    await agent.whenIdle()
+
+    expect(requests).toHaveLength(1)
+    expect(JSON.stringify(requests[0]?.messages)).toContain('current tab')
+    expect(JSON.stringify(requests[0]?.messages)).not.toContain('provisional tab')
+    expect(agent.inbox.nextStep).toHaveLength(0)
+    client.ws.close()
+  })
+
   it('boots the bridge, authenticates over a real socket, and drives real gateway RPCs', { timeout: 60_000 }, async () => {
     const { ctx, port } = await loadComposition()
 
@@ -375,29 +361,6 @@ describe('real Loader composition', () => {
     const listed = client.frames.find((f) => f.t === 'rpc.result' && f.id === 'c-2')!
     const listedText = JSON.stringify((listed as { result: unknown }).result)
     expect(listedText).toContain(sessionId)
-
-    client.ws.close()
-  })
-
-  it('selects the rc.2 ApiProxy topology and drives legacy RPCs over a real socket', { timeout: 60_000 }, async () => {
-    const { ctx, port } = await loadComposition('legacy')
-    const tools = ctx.get('tools') as ToolRegistry
-    expect(tools.get('browser_snapshot')).toBeDefined()
-
-    const client = await connectReady(port)
-    send(client.ws, { t: 'rpc', id: 'legacy-1', method: 'session.create', payload: { cwd: root } })
-    await waitFor(() => client.frames.some((f) => f.t === 'rpc.result' && f.id === 'legacy-1'))
-    const created = client.frames.find((f): f is Extract<BridgeFrame, { t: 'rpc.result' }> => (
-      f.t === 'rpc.result' && f.id === 'legacy-1'
-    ))!
-    expect(created.ok).toBe(true)
-    const sessionId = ((created as { result: { result: { value: { sessionId: string } } } }).result).result.value.sessionId
-    expect(ctx.sessions.get(SessionId(sessionId))?.header.cwd).toBe(root)
-
-    send(client.ws, { t: 'rpc', id: 'legacy-2', method: 'session.list', payload: {} })
-    await waitFor(() => client.frames.some((f) => f.t === 'rpc.result' && f.id === 'legacy-2'))
-    const listed = client.frames.find((f) => f.t === 'rpc.result' && f.id === 'legacy-2')!
-    expect(JSON.stringify((listed as { result: unknown }).result)).toContain(sessionId)
 
     client.ws.close()
   })

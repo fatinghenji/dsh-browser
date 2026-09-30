@@ -3,18 +3,28 @@
  *
  * The extension captures the page immediately after the user chooses to
  * follow it. A live Agent receives that snapshot at once; a deferred session
- * keeps only its newest snapshot until `agent/session-start` publishes the
- * Agent. Injection deliberately does not wake an idle Agent — the snapshot is
+ * keeps only its newest snapshot until `agent/created` publishes the
+ * Agent. Live inboxes also keep only the newest unclaimed browser snapshot.
+ * Injection deliberately does not wake an idle Agent — the snapshot is
  * claimed together with the user's next message.
  *
  * @module
  */
 
 import type { Agent, AgentRegistry } from '@deepseek-ai/dsh-agent'
-import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, type ContextFormed, type UserMessage } from '@deepseek-ai/dsh-llm'
 
-/** Provenance key used for snapshot supersession and transcript presentation. */
-export const BROWSER_CONTEXT_PLUGIN = '@yuxianglin/dsh-bridge-browser'
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** Followed-tab browser page snapshot owned by bridge-browser. */
+    'browser-context': {
+      kind: 'browser-context'
+    } & ContextFormed
+  }
+}
+
+/** MessageSource.kind for snapshot supersession and transcript presentation. */
+export const BROWSER_CONTEXT_KIND = 'browser-context' as const
 
 /** Bound orphaned provisional sessions while retaining normal recent tabs. */
 const DEFAULT_MAX_PENDING = 32
@@ -29,12 +39,22 @@ export function createBrowserSnapshotMessage(snapshot: string): UserMessage {
   return createUserMessage({
     content: [{ type: 'text', text }],
     source: {
-      kind: 'plugin',
-      plugin: BROWSER_CONTEXT_PLUGIN,
+      kind: BROWSER_CONTEXT_KIND,
       form: 'snapshot',
       sections: [{ name: 'browser-page', text }],
     },
   })
+}
+
+/** Supersede pending tab context through the durable Inbox command surface. */
+function injectLatestSnapshot(agent: Agent, snapshot: string): void {
+  for (const message of agent.inbox.nextStep) {
+    if (message.source.kind === BROWSER_CONTEXT_KIND
+      && message.source.form === 'snapshot') {
+      agent.inbox.remove(message.id)
+    }
+  }
+  agent.inject(createBrowserSnapshotMessage(snapshot))
 }
 
 /** Deliver followed-page snapshots to live or not-yet-materialized Agents. */
@@ -55,7 +75,7 @@ export class BrowserContextInjector {
     const agent = this.agents.get(sessionId as Parameters<AgentRegistry['get']>[0])
     if (agent !== undefined) {
       this.pending.delete(sessionId)
-      agent.inject(createBrowserSnapshotMessage(snapshot))
+      injectLatestSnapshot(agent, snapshot)
       return 'injected'
     }
 
@@ -75,7 +95,7 @@ export class BrowserContextInjector {
     const sessionId = String(agent.id)
     const snapshot = this.pending.get(sessionId)
     if (snapshot === undefined) return false
-    agent.inject(createBrowserSnapshotMessage(snapshot))
+    injectLatestSnapshot(agent, snapshot)
     this.pending.delete(sessionId)
     return true
   }
